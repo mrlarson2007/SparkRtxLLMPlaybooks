@@ -10,6 +10,7 @@ one step at a time. You enter your laptop specs (memory), the model and the engi
 1. Detects your OS, memory and GPU.
 2. Downloads the recipe catalog. It keeps a cached copy for 24 hours.
 3. Picks the recipe that fits your memory budget and prints its prerequisites, limitations and notes.
+   On a 128 GB RTX Spark the budget is capped at 96 GB, the most memory that can be assigned to the GPU.
 4. Installs the pinned llama.cpp build to `~/llama-cuda/<build>`. You can set `LLAMA_CPP_DIR` to install
    somewhere else, or `LLAMA_SERVER_PATH` to use an existing `llama-server`.
 5. Downloads the model, draft/MTP and vision projector files to `MODELS_DIR`. The default is `~/llm-models`.

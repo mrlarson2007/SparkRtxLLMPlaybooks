@@ -86,6 +86,15 @@ def _local_files(recipe, root=Path("/models")):
 
 
 class RecipeSelectionTests(unittest.TestCase):
+    def test_memory_budget_capped_at_video_memory_limit(self):
+        self.assertEqual(rss.memory_budget_gb("rtx-spark", 128), (96, 96))
+        self.assertEqual(rss.memory_budget_gb("rtx-spark", 127.6), (96, 96))
+        self.assertEqual(rss.memory_budget_gb("rtx-spark", 128, requested_gb=112), (96, 96))
+        self.assertEqual(rss.memory_budget_gb("rtx-spark", 128, requested_gb=80), (80, 96))
+        self.assertEqual(rss.memory_budget_gb("rtx-spark", 64), (48, None))
+        self.assertEqual(rss.memory_budget_gb("geforce-rtx", 128), (112, None))
+        self.assertEqual(rss.memory_budget_gb("rtx-spark", None), (None, None))
+
     def test_filters_by_memory_budget(self):
         too_small = rss.find_recipes(
             CATALOG, "rtx-spark", "windows", "llama-cpp", "qwen/qwen3.8-flash-next", memory_budget_gb=64

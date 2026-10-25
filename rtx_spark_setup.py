@@ -99,6 +99,52 @@ def detect_gpus() -> list[dict]:
     return gpus
 
 
+# Largest amount of unified memory that can be assigned to the GPU ("video
+# memory"), keyed by hardware id and then by installed memory size in GB.
+MAX_VIDEO_MEMORY_GB = {
+    "rtx-spark": {128: 96},
+}
+
+
+def max_video_memory_gb(hardware: str, system_memory_gb: float | None) -> float | None:
+    """Return the video-memory limit for ``hardware`` with ``system_memory_gb`` installed.
+
+    The detected size is usually a little below the nominal size (e.g. 127.6
+    for 128 GB), so it is matched to the nearest known configuration within
+    10%. Returns ``None`` when no limit is known.
+    """
+    configs = MAX_VIDEO_MEMORY_GB.get(hardware) or {}
+    if not system_memory_gb or not configs:
+        return None
+    nominal = min(configs, key=lambda size: abs(size - system_memory_gb))
+    if abs(nominal - system_memory_gb) <= nominal * 0.1:
+        return configs[nominal]
+    return None
+
+
+def memory_budget_gb(
+    hardware: str,
+    system_memory_gb: float | None,
+    os_reserve_gb: float = 16,
+    requested_gb: float | None = None,
+) -> tuple[float | None, float | None]:
+    """Return ``(budget, cap)``: memory a model may use and the video-memory limit.
+
+    The budget is ``requested_gb`` if given, else ``system_memory_gb -
+    os_reserve_gb``. Either way it is clamped to the hardware's video-memory
+    limit (e.g. 96 GB on a 128 GB RTX Spark).
+    """
+    cap = max_video_memory_gb(hardware, system_memory_gb)
+    budget = requested_gb
+    if budget is None and system_memory_gb:
+        budget = max(system_memory_gb - os_reserve_gb, 0)
+    if budget is not None and cap is not None and budget > cap:
+        if requested_gb is not None:
+            _print_step("warn", f"MEMORY_BUDGET_GB={requested_gb} is above the {cap} GB video-memory limit; using {cap}")
+        budget = cap
+    return budget, cap
+
+
 def detect_system() -> dict:
     """Collect basic facts about the current machine."""
     return {
