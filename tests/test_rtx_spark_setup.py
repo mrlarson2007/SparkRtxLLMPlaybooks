@@ -189,9 +189,21 @@ class IdempotencyTests(unittest.TestCase):
         exe = build_dir / rss.LLAMA_SERVER_EXE
         exe.write_text("#!/bin/sh\necho 'version: 11617 (abc)' >&2\n")
         exe.chmod(0o755)
+        (build_dir / rss.INSTALL_MARKER).write_text("b11617\n")
         with mock.patch.object(rss, "_release_asset_urls") as urls:
             self.assertEqual(rss.install_llama_cpp(FLASH_NEXT, self.root), exe)
             urls.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "uses a POSIX shell script as a fake llama-server")
+    def test_install_redone_when_incomplete(self):
+        build_dir = self.root / "b11617"
+        build_dir.mkdir()
+        exe = build_dir / rss.LLAMA_SERVER_EXE
+        exe.write_text("#!/bin/sh\necho 'version: 11617 (abc)' >&2\n")
+        exe.chmod(0o755)
+        # No completion marker: the install must not be skipped (non-Windows then refuses to install).
+        with self.assertRaisesRegex(RuntimeError, "Windows ARM64"):
+            rss.install_llama_cpp(FLASH_NEXT, self.root)
 
     def test_download_skips_complete_files(self):
         files = rss.model_files_for_recipe(BOLT_E4B)
@@ -228,6 +240,7 @@ class IdempotencyTests(unittest.TestCase):
         fake.write_text(textwrap.dedent("""\
             import http.server, json, sys
             port = int(sys.argv[sys.argv.index("--port") + 1])
+            model = sys.argv[sys.argv.index("-m") + 1]
             class H(http.server.BaseHTTPRequestHandler):
                 def _send(self, body):
                     data = json.dumps(body).encode()
@@ -236,22 +249,38 @@ class IdempotencyTests(unittest.TestCase):
                     self.end_headers()
                     self.wfile.write(data)
                 def do_GET(self):
-                    self._send({"status": "ok"} if self.path == "/health" else {"data": [{"id": "m"}]})
+                    if self.path == "/health":
+                        self._send({"status": "ok"})
+                    elif self.path == "/props":
+                        self._send({"model_path": model})
+                    else:
+                        self._send({"data": [{"id": "alias"}]})
                 def do_POST(self):
                     self._send({"choices": [{"message": {"content": "hi"}}]})
                 def log_message(self, *a):
                     pass
             http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         """))
-        plan = rss.LaunchPlan(argv=[sys.executable, str(fake), "--port", str(port)], port=port)
-        proc = rss.start_server(plan, self.root / "server.log", timeout_s=30, poll_s=0.2)
+        argv = [sys.executable, str(fake), "-m", str(self.root / "a.gguf"), "--port", str(port)]
+        plan = rss.LaunchPlan(argv=argv, port=port)
+        log = self.root / "server.log"
+        proc = rss.start_server(plan, log, timeout_s=30, poll_s=0.2)
         try:
             self.assertIsNotNone(proc)
-            self.assertIsNone(rss.start_server(plan, self.root / "server.log"))
+            self.assertTrue(rss.pid_file_for(log).exists())
+            self.assertIsNone(rss.start_server(plan, log))
             self.assertEqual(rss.chat(plan.base_url, "hello"), "hi")
+            other = rss.LaunchPlan(argv=[*argv[:3], "b.gguf", *argv[4:]], port=port)
+            with self.assertRaisesRegex(RuntimeError, "different model"):
+                rss.start_server(other, log)
+            # After a kernel restart the Popen handle is gone; the saved PID is used instead.
+            rss.stop_server(None, log, plan.base_url)
+            proc.wait(timeout=10)
         finally:
-            rss.stop_server(proc)
-        self.assertIsNotNone(proc.poll())
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertFalse(rss.pid_file_for(log).exists())
 
 
 if __name__ == "__main__":

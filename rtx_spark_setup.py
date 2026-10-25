@@ -17,6 +17,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -38,6 +39,7 @@ DEFAULT_MODELS_DIR = Path.home() / "llm-models"
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "rtx-spark-setup"
 
 IS_WINDOWS = os.name == "nt"
+INSTALL_MARKER = ".rtx-spark-setup-complete"
 LLAMA_SERVER_EXE = "llama-server.exe" if IS_WINDOWS else "llama-server"
 
 
@@ -294,21 +296,27 @@ def install_llama_cpp(
 
     Builds are installed side by side under ``base_dir/<tag>`` (default
     ``~/llama-cuda/b11617``). If a build at least as new as the recipe's
-    minimum version is already installed there, the step is skipped.
+    minimum version is already installed there, the step is skipped. A marker
+    file is written only after every ZIP has been extracted, so an interrupted
+    install is detected and redone.
     """
     tag = recipe.get("backend_version")
     if not tag or not str(tag).startswith("b"):
         raise ValueError(f"Recipe does not pin a llama.cpp build tag (backend_version={tag!r}).")
     min_build = _build_number(recipe.get("backend_min_version")) or _build_number(tag)
     install_dir = Path(base_dir).expanduser() / tag
+    marker = install_dir / INSTALL_MARKER
 
     exe = find_llama_server(install_dir)
     if exe and not force:
         build = llama_server_version(exe)
-        if build is None or build >= min_build:
+        if marker.exists() and build is not None and build >= min_build:
             _print_step("skip", f"llama.cpp {tag} installed at {exe}")
             return exe
-        _print_step("warn", f"{exe} reports build {build} < required {min_build}; reinstalling")
+        reason = "install incomplete" if not marker.exists() else (
+            "llama-server --version failed" if build is None else f"build {build} < required {min_build}"
+        )
+        _print_step("warn", f"{exe}: {reason}; reinstalling")
 
     if not IS_WINDOWS:
         raise RuntimeError(
@@ -329,7 +337,11 @@ def install_llama_cpp(
     exe = find_llama_server(install_dir)
     if not exe:
         raise RuntimeError(f"{LLAMA_SERVER_EXE} not found after extracting into {install_dir}.")
-    _print_step("ok", f"Installed llama.cpp {tag} at {exe}")
+    build = llama_server_version(exe)
+    if build is None:
+        raise RuntimeError(f"{exe} --version failed; the install may be missing DLLs.")
+    marker.write_text(f"{tag}\n", encoding="utf-8")
+    _print_step("ok", f"Installed llama.cpp {tag} (build {build}) at {exe}")
     return exe
 
 
@@ -526,6 +538,10 @@ class LaunchPlan:
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    @property
+    def model_path(self) -> str | None:
+        return _first(_option_values(self.argv), _MODEL)
+
     def powershell(self) -> str:
         """Return the command formatted for copy/paste into PowerShell."""
 
@@ -629,6 +645,34 @@ def server_is_healthy(base_url: str) -> bool:
         return False
 
 
+def running_model(base_url: str) -> str | None:
+    """Return the model file a running llama-server reports, if it says."""
+    try:
+        path = _http_json(f"{base_url}/props").get("model_path")
+        if path:
+            return path
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    try:
+        models = _http_json(f"{base_url}/v1/models").get("data") or []
+        model_id = models[0].get("id") if models else None
+        # The id is an --alias when one is set; only trust it if it looks like a file.
+        return model_id if model_id and model_id.lower().endswith(".gguf") else None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _same_model(running: str, wanted: str) -> bool:
+    def name(path: str) -> str:
+        return path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+    return name(running) == name(wanted)
+
+
+def pid_file_for(log_file: Path | str) -> Path:
+    return Path(log_file).expanduser().with_suffix(".pid")
+
+
 def port_in_use(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1)
@@ -640,11 +684,18 @@ def start_server(
 ) -> subprocess.Popen | None:
     """Start llama-server in the background and wait until ``/health`` is ok.
 
-    Returns ``None`` (and does nothing) if a healthy server is already
-    listening on the configured host/port.
+    Returns ``None`` (and does nothing) if a healthy server running the same
+    model is already listening on the configured host/port. Raises if the
+    server on that port is running a different model.
     """
     if server_is_healthy(plan.base_url):
-        _print_step("skip", f"llama-server already running at {plan.base_url}")
+        running, wanted = running_model(plan.base_url), plan.model_path
+        if running and wanted and not _same_model(running, wanted):
+            raise RuntimeError(
+                f"A llama-server at {plan.base_url} is running a different model ({running}). "
+                "Stop it (step 9) or choose a different PORT, then re-run this step."
+            )
+        _print_step("skip", f"llama-server already running at {plan.base_url} ({running or 'model unknown'})")
         return None
     if port_in_use(plan.host, plan.port):
         raise RuntimeError(
@@ -660,6 +711,7 @@ def start_server(
             plan.argv, stdout=log, stderr=subprocess.STDOUT,
             cwd=str(Path(plan.argv[0]).parent), creationflags=flags,
         )
+    pid_file_for(log_file).write_text(str(proc.pid), encoding="utf-8")
     _print_step("run", f"Started llama-server (pid {proc.pid}); logging to {log_file}")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -672,16 +724,34 @@ def start_server(
     raise TimeoutError(f"llama-server did not become healthy within {timeout_s}s; see {log_file}")
 
 
-def stop_server(proc: subprocess.Popen | None) -> None:
-    if proc is None or proc.poll() is not None:
-        _print_step("skip", "No server process started from this notebook is running")
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    _print_step("ok", f"Stopped llama-server (pid {proc.pid})")
+def stop_server(
+    proc: subprocess.Popen | None, log_file: Path | str | None = None, base_url: str | None = None
+) -> None:
+    """Stop the server started by :func:`start_server`.
+
+    If ``proc`` is ``None`` (for example after a kernel restart), the PID saved
+    next to ``log_file`` is used, but only while a server is still answering
+    at ``base_url``.
+    """
+    pid_file = pid_file_for(log_file) if log_file else None
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        _print_step("ok", f"Stopped llama-server (pid {proc.pid})")
+    elif pid_file and pid_file.exists() and base_url and server_is_healthy(base_url):
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+            _print_step("ok", f"Stopped llama-server (pid {pid} from {pid_file})")
+        except OSError as exc:
+            _print_step("warn", f"Could not stop pid {pid}: {exc}")
+    else:
+        _print_step("skip", "No llama-server started by this notebook is running")
+    if pid_file and pid_file.exists():
+        pid_file.unlink()
 
 
 def chat(base_url: str, prompt: str, model: str | None = None, timeout: float = 600) -> str:
